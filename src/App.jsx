@@ -6,19 +6,26 @@ import { Socket, Presence } from "phoenix";
 /* --- Env (Vite) --- */
 const RAW_SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL;
 const RAW_SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY;
-const RAW_API_URL = import.meta.env.VITE_API_URL;
-const RAW_WS_URL = import.meta.env.VITE_WS_URL;
+const RAW_API_URL = (import.meta.env.VITE_API_URL || "").replace(/\/$/, ""); // no trailing slash
+const RAW_WS_URL = (import.meta.env.VITE_WS_URL || "").replace(/\/$/, "");
 
-/* --- Use relative paths when proxying --- */
-const API_URL = RAW_API_URL || "";     // empty => use relative "/api/..."
-const WS_URL = RAW_WS_URL || "/socket"; // empty => use relative "/socket"
+/* --- Compute base URLs --- */
+/* When RAW_API_URL is empty we will use relative paths ("/api/...") — good for local dev or when you proxy the frontend to backend.
+   When RAW_API_URL is set (eg. https://91.98.13.73), we use that as the API base.
+*/
+const API_BASE = RAW_API_URL || ""; // empty => relative fetch('/api/...')
+const WS_BASE =
+  RAW_WS_URL ||
+  (API_BASE
+    ? (API_BASE.startsWith("https") ? "wss" : "ws") + "://" + API_BASE.replace(/^https?:\/\//, "") + "/socket"
+    : "/socket");
 
 /* --- Helpers --- */
-const normalizeApiBase = (u) => (u ? u.replace(/\/$/, "") : u);
+const normalizeApiBase = (u) => (u ? u.replace(/\/$/, "") : "");
 
-/* --- Supabase client (safe) --- */
+/* --- Supabase client --- */
 if (!RAW_SUPABASE_URL || !RAW_SUPABASE_ANON_KEY) {
-  console.warn("⚠️ VITE_SUPABASE_URL or VITE_SUPABASE_ANON_KEY not set.");
+  console.warn("⚠️ VITE_SUPABASE_URL or VITE_SUPABASE_ANON_KEY not set. Supabase features will be limited.");
 }
 const supabase = (() => {
   try {
@@ -48,7 +55,6 @@ export default function App() {
   const channelRef = useRef(null);
   const presenceRef = useRef(null);
 
-  /* Session restore + auth change listener */
   useEffect(() => {
     (async () => {
       try {
@@ -158,7 +164,7 @@ export default function App() {
 
   const connectSocket = (token, chatId) => {
     disconnectSocket();
-    const socket = new Socket(WS_URL, { params: { token } });
+    const socket = new Socket(WS_BASE, { params: { token } });
     socket.connect();
     socketRef.current = socket;
 
@@ -190,11 +196,18 @@ export default function App() {
     if (!supabase) return;
     const { data: { session } } = await supabase.auth.getSession();
     if (!session) return;
-    const res = await fetch(`/api/history?chat_id=${chatId}`, {
-      headers: { Authorization: `Bearer ${session.access_token}` },
-    });
-    if (!res.ok) throw new Error("history fetch failed: " + res.status);
-    setMessages(await res.json());
+    const apiBase = normalizeApiBase(API_BASE) || ""; // "" => relative to current origin
+    const url = (apiBase ? apiBase : "") + `/api/history?chat_id=${chatId}`;
+    try {
+      const res = await fetch(url, {
+        headers: { Authorization: `Bearer ${session.access_token}` },
+      });
+      if (!res.ok) throw new Error("history fetch failed: " + res.status);
+      setMessages(await res.json());
+    } catch (err) {
+      console.error("History load error", err);
+      throw err;
+    }
   };
 
   const selectChat = async (chatId) => {
@@ -223,7 +236,7 @@ export default function App() {
           <button onClick={login}>Login</button>
           <button onClick={signup} style={{ marginLeft: 8 }}>Signup</button>
           <p style={{ color: "gray" }}>Supabase: {RAW_SUPABASE_URL}</p>
-          <p style={{ color: "gray" }}>API → proxy /api | WS → proxy /socket</p>
+          <p style={{ color: "gray" }}>API: {API_BASE || "(relative)"} WS: {WS_BASE}</p>
         </div>
       ) : (
         <div>
