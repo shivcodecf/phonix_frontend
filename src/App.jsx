@@ -192,23 +192,54 @@ export default function App() {
   };
 
   /* --- History --- */
+
+
   const loadHistory = async (chatId) => {
-    if (!supabase) return;
-    const { data: { session } } = await supabase.auth.getSession();
-    if (!session) return;
-    const apiBase = normalizeApiBase(API_BASE) || ""; // "" => relative to current origin
-    const url = (apiBase ? apiBase : "") + `/api/history?chat_id=${chatId}`;
-    try {
-      const res = await fetch(url, {
-        headers: { Authorization: `Bearer ${session.access_token}` },
-      });
-      if (!res.ok) throw new Error("history fetch failed: " + res.status);
-      setMessages(await res.json());
-    } catch (err) {
-      console.error("History load error", err);
-      throw err;
+  if (!supabase) return;
+  const { data: { session } } = await supabase.auth.getSession();
+  if (!session) return;
+
+  const apiBase = normalizeApiBase(API_BASE) || ""; // "" => relative to current origin
+  const url = `${apiBase}/api/history?chat_id=${encodeURIComponent(chatId)}`;
+
+  try {
+    const res = await fetch(url, {
+      headers: { Authorization: `Bearer ${session.access_token}` },
+    });
+
+    if (!res.ok) {
+      // include body text for debugging if available
+      const text = await res.text().catch(() => "");
+      const msg = `history fetch failed: ${res.status} ${res.statusText} ${text ? "- " + text : ""}`;
+      console.error("History load error (non-2xx):", msg);
+      throw new Error(msg);
     }
-  };
+
+    const body = await res.json().catch(e => {
+      console.error("History load error: invalid json", e);
+      return null;
+    });
+
+    // DEBUG: log the whole body once to help track weird shapes
+    console.debug("history response body:", body);
+
+    // Normalize to an array of items (backend returns { ok: true, items: [...] } or similar)
+    const items = Array.isArray(body?.items) ? body.items
+                 : Array.isArray(body)            ? body      // handle if API returned array directly
+                 : [];                              // fallback empty array
+
+    // setMessages must always get an array
+    setMessages(items);
+
+    return items;
+  } catch (err) {
+    console.error("History load error", err);
+    // preserve previous behavior (rethrow if callers depend on it)
+    throw err;
+  }
+};
+
+
 
   const selectChat = async (chatId) => {
     setCurrentChat(chatId);
