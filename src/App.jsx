@@ -10,9 +10,6 @@ const RAW_API_URL = (import.meta.env.VITE_API_URL || "").replace(/\/$/, ""); // 
 const RAW_WS_URL = (import.meta.env.VITE_WS_URL || "").replace(/\/$/, "");
 
 /* --- Compute base URLs --- */
-/* When RAW_API_URL is empty we will use relative paths ("/api/...") — good for local dev or when you proxy the frontend to backend.
-   When RAW_API_URL is set (eg. https://91.98.13.73), we use that as the API base.
-*/
 const API_BASE = RAW_API_URL || ""; // empty => relative fetch('/api/...')
 const WS_BASE =
   RAW_WS_URL ||
@@ -91,7 +88,43 @@ export default function App() {
     };
   }, []);
 
-  /* --- Auth --- */
+  /* --- Auth helpers --- */
+  const tokenIsExpired = (session) => {
+    // Many supabase clients put expires_at in seconds. If missing, assume expired.
+    if (!session || !session.expires_at) return true;
+    // Consider token expired if less than 30s left
+    return (session.expires_at * 1000) - Date.now() < 30_000;
+  };
+
+  // Ensure we have a fresh session (returns session or null)
+  const ensureFreshSession = async () => {
+    if (!supabase) return null;
+    try {
+      const { data: { session } } = await supabase.auth.getSession();
+      if (!session) return null;
+      if (!tokenIsExpired(session)) return session;
+
+      // try refreshSession() if supported by the client
+      if (typeof supabase.auth.refreshSession === "function") {
+        try {
+          const { data } = await supabase.auth.refreshSession();
+          return data?.session || null;
+        } catch (e) {
+          console.warn("refreshSession failed", e);
+          return null;
+        }
+      }
+
+      // fallback: re-call getSession (some clients auto refresh if refresh token exists)
+      const { data: { session: again } } = await supabase.auth.getSession();
+      return again || null;
+    } catch (e) {
+      console.warn("ensureFreshSession error", e);
+      return null;
+    }
+  };
+
+  /* --- Auth actions --- */
   const signup = async () => {
     if (!supabase) return alert("Supabase not configured.");
     const { error } = await supabase.auth.signUp({ email, password });
@@ -162,7 +195,10 @@ export default function App() {
     presenceRef.current = null;
   };
 
-  const connectSocket = (token, chatId) => {
+  // connectSocket now accepts token and chatId and will retry once if join fails due to expired token.
+  const connectSocket = async (token, chatId, { retry = true } = {}) => {
+    if (!token || !chatId) return console.warn("connectSocket: missing token or chatId");
+
     disconnectSocket();
     const socket = new Socket(WS_BASE, { params: { token } });
     socket.connect();
@@ -171,7 +207,24 @@ export default function App() {
     const channel = socket.channel(`chat:${chatId}`, {});
     channel.join()
       .receive("ok", () => console.log("✅ joined", chatId))
-      .receive("error", (err) => console.error("❌ join error", err));
+      .receive("error", async (err) => {
+        console.error("❌ join error", err);
+        const maybeExpired =
+          (err?.reason && String(err.reason).toLowerCase().includes("jwt")) ||
+          (err?.message && String(err.message).toLowerCase().includes("expired")) ||
+          (err?.status === 401) ||
+          (err?.status === 403 && String(err.message || "").toLowerCase().includes("token"));
+
+        if (maybeExpired && retry) {
+          const fresh = await ensureFreshSession();
+          if (fresh?.access_token) {
+            console.log("Retrying socket join with refreshed token");
+            connectSocket(fresh.access_token, chatId, { retry: false });
+          } else {
+            console.warn("Could not refresh session, user must re-login");
+          }
+        }
+      });
 
     channel.on("new_message", (msg) => {
       setMessages((prev) => [...prev, msg]);
@@ -192,62 +245,59 @@ export default function App() {
   };
 
   /* --- History --- */
-
-
   const loadHistory = async (chatId) => {
-  if (!supabase) return;
-  const { data: { session } } = await supabase.auth.getSession();
-  if (!session) return;
+    if (!supabase) return;
+    const { data: { session } } = await supabase.auth.getSession();
+    if (!session) return;
 
-  const apiBase = normalizeApiBase(API_BASE) || ""; // "" => relative to current origin
-  const url = `${apiBase}/api/history?chat_id=${encodeURIComponent(chatId)}`;
+    const apiBase = normalizeApiBase(API_BASE) || ""; // "" => relative to current origin
+    const url = `${apiBase}/api/history?chat_id=${encodeURIComponent(chatId)}`;
 
-  try {
-    const res = await fetch(url, {
-      headers: { Authorization: `Bearer ${session.access_token}` },
-    });
+    try {
+      const res = await fetch(url, {
+        headers: { Authorization: `Bearer ${session.access_token}` },
+      });
 
-    if (!res.ok) {
-      // include body text for debugging if available
-      const text = await res.text().catch(() => "");
-      const msg = `history fetch failed: ${res.status} ${res.statusText} ${text ? "- " + text : ""}`;
-      console.error("History load error (non-2xx):", msg);
-      throw new Error(msg);
+      if (!res.ok) {
+        const text = await res.text().catch(() => "");
+        const msg = `history fetch failed: ${res.status} ${res.statusText} ${text ? "- " + text : ""}`;
+        console.error("History load error (non-2xx):", msg);
+        throw new Error(msg);
+      }
+
+      const body = await res.json().catch(e => {
+        console.error("History load error: invalid json", e);
+        return null;
+      });
+
+      console.debug("history response body:", body);
+
+      // Normalize a few possible shapes:
+      const items = Array.isArray(body?.items) ? body.items
+                   : Array.isArray(body)            ? body
+                   : Array.isArray(body?.data)      ? body.data
+                   : [];
+
+      setMessages(items);
+      return items;
+    } catch (err) {
+      console.error("History load error", err);
+      throw err;
     }
+  };
 
-    const body = await res.json().catch(e => {
-      console.error("History load error: invalid json", e);
-      return null;
-    });
-
-    // DEBUG: log the whole body once to help track weird shapes
-    console.debug("history response body:", body);
-
-    // Normalize to an array of items (backend returns { ok: true, items: [...] } or similar)
-    const items = Array.isArray(body?.items) ? body.items
-                 : Array.isArray(body)            ? body      // handle if API returned array directly
-                 : [];                              // fallback empty array
-
-    // setMessages must always get an array
-    setMessages(items);
-
-    return items;
-  } catch (err) {
-    console.error("History load error", err);
-    // preserve previous behavior (rethrow if callers depend on it)
-    throw err;
-  }
-};
-
-
-
+  // selectChat ensures a fresh session (so the socket token is valid) before connecting
   const selectChat = async (chatId) => {
     setCurrentChat(chatId);
-    const { data: { session } } = await supabase.auth.getSession();
-    if (session) {
-      connectSocket(session.access_token, chatId);
-      await loadHistory(chatId);
+
+    const fresh = await ensureFreshSession();
+    if (!fresh) {
+      console.warn("No session available / could not refresh. Please login again.");
+      return;
     }
+
+    connectSocket(fresh.access_token, chatId);
+    await loadHistory(chatId);
   };
 
   const sendMessage = () => {
