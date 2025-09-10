@@ -6,18 +6,26 @@ import { Socket, Presence } from "phoenix";
 /* --- Env (Vite) --- */
 const RAW_SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL;
 const RAW_SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY;
-const RAW_API_URL = (import.meta.env.VITE_API_URL || "").replace(/\/$/, "");
+const RAW_API_URL = (import.meta.env.VITE_API_URL || "").replace(/\/$/, ""); // no trailing slash
 const RAW_WS_URL = (import.meta.env.VITE_WS_URL || "").replace(/\/$/, "");
 
 /* --- Compute base URLs --- */
-const API_BASE = RAW_API_URL || "";
+const API_BASE = RAW_API_URL || ""; // empty => relative fetch('/api/...')
 const WS_BASE =
   RAW_WS_URL ||
   (API_BASE
     ? (API_BASE.startsWith("https") ? "wss" : "ws") + "://" + API_BASE.replace(/^https?:\/\//, "") + "/socket"
     : "/socket");
 
+/* --- Helpers --- */
 const normalizeApiBase = (u) => (u ? u.replace(/\/$/, "") : "");
+const safeJSON = async (res) => {
+  try {
+    return await res.json();
+  } catch (e) {
+    return null;
+  }
+};
 
 /* --- Supabase client --- */
 if (!RAW_SUPABASE_URL || !RAW_SUPABASE_ANON_KEY) {
@@ -51,67 +59,26 @@ export default function App() {
   const channelRef = useRef(null);
   const presenceRef = useRef(null);
 
-  /* ----------------- session helpers ----------------- */
-  const tokenIsExpired = (session) => {
-    if (!session) return true;
-    // supabase may store expires_at in seconds
-    const expires = session.expires_at ?? session.expires ?? null;
-    if (!expires) return true;
-    return (expires * 1000) - Date.now() < 30_000; // expire threshold 30s
-  };
-
-  const ensureFreshSession = async () => {
-    if (!supabase) return null;
-    try {
-      const { data: { session } } = await supabase.auth.getSession();
-      if (!session) return null;
-      if (!tokenIsExpired(session)) return session;
-
-      // try refreshSession if available
-      if (typeof supabase.auth.refreshSession === "function") {
-        try {
-          const r = await supabase.auth.refreshSession();
-          return r.data?.session || null;
-        } catch (e) {
-          console.warn("refreshSession failed", e);
-        }
-      }
-
-      // fallback: call getSession again (some clients auto refresh)
-      const { data: { session: again } } = await supabase.auth.getSession();
-      return again || null;
-    } catch (e) {
-      console.warn("ensureFreshSession error", e);
-      return null;
-    }
-  };
-
-  /* ----------------- lifecycle: restore session & selected chat ----------------- */
   useEffect(() => {
     (async () => {
       try {
         if (!supabase) return;
 
+        // Try to restore session (async)
         const { data: { session } } = await supabase.auth.getSession();
+        console.debug("RESTORE: supabase session:", session);
+
         if (session) {
           setUser(session.user);
-          await fetchUserChats(session.user.id);
+          const mapped = await fetchUserChats(session.user.id);
+          console.debug("RESTORE: fetched chats:", mapped || "(no chats)");
 
+          // restore last selected chat from localStorage (if valid)
           const persisted = localStorage.getItem("chat:last");
-          if (persisted) {
-            // ensure user is member of persisted chat
-            const { data: memberships } = await supabase
-              .from("chat_members")
-              .select("chat_id")
-              .eq("user_id", session.user.id);
-
-            const ids = new Set((memberships || []).map((m) => m.chat_id));
-            if (ids.has(persisted)) {
-              // selectChat handles history + socket connect
-              await selectChat(persisted, session);
-            } else {
-              console.debug("persisted chat not available for user:", persisted);
-            }
+          console.debug("RESTORE: persisted chat:last:", persisted);
+          if (persisted && Array.isArray(mapped) && mapped.find((c) => c.id === persisted)) {
+            // selectChat will ensure fresh token, connect socket and load history
+            await selectChat(persisted);
           }
         }
       } catch (err) {
@@ -119,18 +86,13 @@ export default function App() {
       }
     })();
 
-    // subscribe auth state changes
+    // keep UI in sync with auth changes (login/logout)
     let authSub;
-    if (supabase && typeof supabase.auth.onAuthStateChange === "function") {
+    if (supabase) {
       authSub = supabase.auth.onAuthStateChange((_event, session) => {
         if (session) {
           setUser(session.user);
           fetchUserChats(session.user.id);
-          // try restore chat if none selected
-          const persisted = localStorage.getItem("chat:last");
-          if (persisted && !currentChat) {
-            selectChat(persisted).catch(() => {});
-          }
         } else {
           setUser(null);
           setChats([]);
@@ -148,7 +110,46 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  /* ----------------- auth actions ----------------- */
+  /* --- Auth helpers --- */
+  const tokenIsExpired = (session) => {
+    if (!session) return true;
+    // supabase stores expires_at in seconds (often)
+    if (session.expires_at) {
+      return (session.expires_at * 1000) - Date.now() < 30_000;
+    }
+    // fallback to true (force refresh/relogin)
+    return true;
+  };
+
+  // Ensure we have a fresh session (returns session or null)
+  const ensureFreshSession = async () => {
+    if (!supabase) return null;
+    try {
+      const { data: { session } } = await supabase.auth.getSession();
+      if (!session) return null;
+      if (!tokenIsExpired(session)) return session;
+
+      // try refreshSession() if the client supports it
+      if (typeof supabase.auth.refreshSession === "function") {
+        try {
+          const { data } = await supabase.auth.refreshSession();
+          return data?.session || null;
+        } catch (e) {
+          console.warn("refreshSession failed", e);
+          return null;
+        }
+      }
+
+      // fallback: call getSession again (some clients auto refresh if refresh token exists)
+      const { data: { session: again } } = await supabase.auth.getSession();
+      return again || null;
+    } catch (e) {
+      console.warn("ensureFreshSession error", e);
+      return null;
+    }
+  };
+
+  /* --- Auth actions --- */
   const signup = async () => {
     if (!supabase) return alert("Supabase not configured.");
     const { error } = await supabase.auth.signUp({ email, password });
@@ -175,15 +176,23 @@ export default function App() {
     try { supabase.removeAllChannels(); } catch {}
   };
 
-  /* ----------------- fetch chats ----------------- */
+  /* --- Fetch chats --- */
   const fetchUserChats = async (userId) => {
-    if (!supabase) return setChats([]);
+    if (!supabase) return [];
     const { data, error } = await supabase
       .from("chat_members")
       .select("chat_id,chats(name,id)")
       .eq("user_id", userId);
-    if (error) return console.error("fetchUserChats error", error);
-    setChats((data || []).map((c) => ({ id: c.chat_id, name: c.chats?.name || "Unnamed Chat" })));
+
+    if (error) {
+      console.error("fetchUserChats error", error);
+      setChats([]);
+      return [];
+    }
+
+    const mapped = (data || []).map((c) => ({ id: c.chat_id, name: c.chats?.name || "Unnamed Chat" }));
+    setChats(mapped);
+    return mapped;
   };
 
   const createChat = async () => {
@@ -210,7 +219,7 @@ export default function App() {
     alert("✅ Invites processed.");
   };
 
-  /* ----------------- socket / presence ----------------- */
+  /* --- Socket / Presence --- */
   const disconnectSocket = () => {
     try { channelRef.current?.leave(); } catch {}
     try { socketRef.current?.disconnect(); } catch {}
@@ -219,11 +228,9 @@ export default function App() {
     presenceRef.current = null;
   };
 
+  // connectSocket now accepts token and chatId and will retry once if join fails due to expired token.
   const connectSocket = async (token, chatId, { retry = true } = {}) => {
-    if (!token || !chatId) {
-      console.warn("connectSocket missing token or chatId");
-      return;
-    }
+    if (!token || !chatId) return console.warn("connectSocket: missing token or chatId");
 
     disconnectSocket();
     const socket = new Socket(WS_BASE, { params: { token } });
@@ -238,14 +245,16 @@ export default function App() {
         const maybeExpired =
           (err?.reason && String(err.reason).toLowerCase().includes("jwt")) ||
           (err?.message && String(err.message).toLowerCase().includes("expired")) ||
-          (err?.status === 401) || (err?.status === 403);
+          (err?.status === 401) ||
+          (err?.status === 403 && String(err.message || "").toLowerCase().includes("token"));
+
         if (maybeExpired && retry) {
           const fresh = await ensureFreshSession();
           if (fresh?.access_token) {
             console.log("Retrying socket join with refreshed token");
             connectSocket(fresh.access_token, chatId, { retry: false });
           } else {
-            console.warn("Could not refresh session for socket join; user may need to re-login");
+            console.warn("Could not refresh session, user must re-login");
           }
         }
       });
@@ -268,93 +277,66 @@ export default function App() {
     presenceRef.current = presence;
   };
 
-  /* ----------------- history ----------------- */
+  /* --- History --- */
   const loadHistory = async (chatId) => {
-    if (!supabase) {
-      console.warn("Supabase client not configured; skipping history load");
-      setMessages([]);
-      return [];
-    }
-
+    if (!supabase) return [];
     const { data: { session } } = await supabase.auth.getSession();
-    if (!session) {
-      console.debug("no session available; skipping history load");
-      setMessages([]);
-      return [];
-    }
+    if (!session) return [];
 
-    const apiBase = normalizeApiBase(API_BASE) || "";
+    const apiBase = normalizeApiBase(API_BASE) || ""; // "" => relative to current origin
     const url = `${apiBase}/api/history?chat_id=${encodeURIComponent(chatId)}`;
-    console.debug("loading history from", url);
 
     try {
-      const res = await fetch(url, { headers: { Authorization: `Bearer ${session.access_token}` } });
+      const res = await fetch(url, {
+        headers: { Authorization: `Bearer ${session.access_token}` },
+      });
+
       if (!res.ok) {
         const text = await res.text().catch(() => "");
         const msg = `history fetch failed: ${res.status} ${res.statusText} ${text ? "- " + text : ""}`;
-        console.error(msg);
+        console.error("History load error (non-2xx):", msg);
         throw new Error(msg);
       }
 
-      const body = await res.json().catch(e => {
-        console.error("History load: invalid json", e);
-        return null;
-      });
-
+      const body = await safeJSON(res);
       console.debug("history response body:", body);
 
-      // Accept a few shapes: { items: [...] } or direct array or { data: [...] }
+      // Normalize a few possible shapes:
       const items = Array.isArray(body?.items) ? body.items
                    : Array.isArray(body)            ? body
                    : Array.isArray(body?.data)      ? body.data
                    : [];
 
-      // canonicalize a bit
-      const normalized = items.map((it) => ({
-        id: it.id ?? null,
-        chat_id: it.chat_id ?? chatId,
-        sender_id: it.sender_id ?? it.user_id ?? "unknown",
-        content: it.content ?? "",
-        inserted_at: it.inserted_at ?? null,
-        client_msg_id: it.client_msg_id ?? null,
-      }));
-
-      setMessages(normalized);
-      return normalized;
+      setMessages(items);
+      return items;
     } catch (err) {
       console.error("History load error", err);
-      setMessages([]);
-      return [];
+      throw err;
     }
   };
 
-  /* ----------------- select chat ----------------- */
-  const selectChat = async (chatId, sessionArg = null) => {
+  // selectChat ensures a fresh session (so the socket token is valid) before connecting
+  const selectChat = async (chatId) => {
     setCurrentChat(chatId);
     localStorage.setItem("chat:last", chatId);
 
-    // ensure we have fresh session for socket token
-    const fresh = sessionArg || (await ensureFreshSession());
+    const fresh = await ensureFreshSession();
     if (!fresh) {
-      console.warn("No session available to connect socket; please login.");
-      // still attempt to load history if possible (some APIs may not require auth)
-      await loadHistory(chatId).catch(() => {});
+      console.warn("No session available / could not refresh. Please login again.");
       return;
     }
 
-    // load history first, then connect socket (avoids race)
-    await loadHistory(chatId).catch(() => {});
     connectSocket(fresh.access_token, chatId);
+    await loadHistory(chatId);
   };
 
-  /* ----------------- send message ----------------- */
   const sendMessage = () => {
     if (!channelRef.current || !input.trim()) return;
     channelRef.current.push("new_message", { content: input });
     setInput("");
   };
 
-  /* ----------------- UI ----------------- */
+  /* --- UI --- */
   return (
     <div style={{ padding: 20 }}>
       {!user ? (
@@ -397,7 +379,9 @@ export default function App() {
               </div>
 
               <div style={{ marginTop: 12, border: "1px solid #ccc", padding: 8, height: 240, overflowY: "auto" }}>
-                {messages.map((m, i) => <div key={i}><b>{m.sender_id || "anon"}</b>: {m.content}</div>)}
+                {messages.length === 0 ? <p style={{ color: "gray" }}>No messages</p> : messages.map((m, i) => (
+                  <div key={i}><b>{m.sender_id || m.sender || "anon"}</b>: {m.content}</div>
+                ))}
               </div>
 
               <div style={{ marginTop: 8 }}>
